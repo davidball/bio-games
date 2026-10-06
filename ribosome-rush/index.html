@@ -25,6 +25,7 @@
   .base.correct { color: #3fb950; }
   .base.wrong { color: #f85149; background: #3d1214; border-radius: 3px; }
   .base.pending { color: #484f58; }
+  .base.wobble { color: #d29922; background: #3a2d0b; border-radius: 3px; }
   .codon-group { border-left: 2px solid #30363d; margin-left: 4px; padding-left: 4px; }
   #input-row { margin: 16px 0; }
   #typed { font-size: 22px; letter-spacing: 4px; }
@@ -33,6 +34,9 @@
   #feedback { min-height: 24px; margin-bottom: 12px; font-size: 15px; }
   #feedback.good { color: #3fb950; }
   #feedback.bad { color: #f85149; }
+  #feedback.wobble { color: #d29922; }
+  #hint { color: #d29922; background: #2b2109; border: 1px solid #5c4813; border-radius: 6px;
+          padding: 6px 10px; margin-bottom: 12px; font-size: 13px; }
   .protein { margin: 16px 0; font-size: 20px; }
   .bead { display: inline-block; padding: 2px 8px; margin: 2px; border-radius: 12px; font-size: 14px; }
   .stats { color: #8b949e; font-size: 13px; margin-top: 12px; }
@@ -64,6 +68,7 @@
     <span id="typed"><span class="cursor">|</span></span>
   </div>
   <div id="feedback"></div>
+  <div id="hint" class="hidden"></div>
 
   <div class="protein" id="protein"></div>
   <div class="stats" id="stats"></div>
@@ -78,8 +83,25 @@
 </div>
 
 <script>
-// Pairing rules: DNA template -> mRNA
-const PAIR = { A: 'U', T: 'A', G: 'C', C: 'G' };
+// Pairing rules. The player types mRNA (RNA) bases directly: A, U, G, C.
+// DNA template -> expected mRNA base: A->U, T->A, C->G, G->C
+const MRNA_FOR_TEMPLATE = { A: 'U', T: 'A', G: 'C', C: 'G' };
+// Equivalent check from the typed mRNA base back to the template: A->T, U->A, G->C, C->G
+const TEMPLATE_FOR_MRNA = { A: 'T', U: 'A', G: 'C', C: 'G' };
+const RNA_KEYS = ['A', 'U', 'G', 'C'];
+
+// Wobble rules (3rd codon position only, i % 3 === 2). A wrong base is accepted as a
+// "wobble" if the typed base and the expected base fall in the same group:
+//   - pyrimidines {U, C}: anticodon G reads U or C (G-U wobble)
+//   - purines {A, G}:     anticodon U reads A or G
+//   - inosine {U, C, A}:  anticodon I reads U, C, or A
+// A wobble-accepted base is translated as the expected base (silent: same amino acid).
+const WOBBLE_GROUPS = [
+  ['U', 'C'],
+  ['A', 'G'],
+  ['U', 'C', 'A']
+];
+const WOBBLE_HINT = 'Wobble! The 3rd codon base can pair loosely with the tRNA anticodon (G–U, I–U/C/A), so the same amino acid still gets added.';
 
 // 64-codon table: codon -> amino acid (3-letter). Stops = null.
 const CODONS = {
@@ -117,95 +139,74 @@ let protein = [];     // amino acid names built
 let mistakes = 0;
 let startTime = null;
 let finished = false;
+let wobbleHintShown = false;
 
 const dnaEl = document.getElementById('dna-strand');
 const rnaEl = document.getElementById('rna-strand');
 const typedEl = document.getElementById('typed');
-const feedbackEl = document.getElementById('feedback);
-const proteinEl = document.getElementById('protein);
-const statsEl = document.getElementById('stats);
-const stageLabel = document.getElementById('stage-label);
-const startScreen = document.getElementById('start-screen);
-const endScreen = document.getElementById('end-screen);
-const endMsg = document.getElementById('end-msg);
+const feedbackEl = document.getElementById('feedback');
+const hintEl = document.getElementById('hint');
+const proteinEl = document.getElementById('protein');
+const statsEl = document.getElementById('stats');
+const stageLabel = document.getElementById('stage-label');
+const startScreen = document.getElementById('start-screen');
+const endScreen = document.getElementById('end-screen');
+const endMsg = document.getElementById('end-msg');
+
+const INSTRUCTIONS = 'Type the mRNA bases (A, U, G, C) that pair with each DNA template base: A→U, T→A, C→G, G→C. RNA uses U, not T.';
+
+function expectedBase(i) {
+  return MRNA_FOR_TEMPLATE[GENES[geneIndex].dna[i]];
+}
+
+function isWobble(i, base) {
+  if (i % 3 !== 2) return false;
+  const exp = expectedBase(i);
+  if (!exp || base === exp) return false;
+  return WOBBLE_GROUPS.some(g => g.includes(base) && g.includes(exp));
+}
+
+// 'correct' | 'wobble' | 'wrong' for the typed mRNA base at position i
+function baseStatus(i) {
+  const dna = GENES[geneIndex].dna;
+  if (TEMPLATE_FOR_MRNA[typed[i]] === dna[i]) return 'correct';
+  if (isWobble(i, typed[i])) return 'wobble';
+  return 'wrong';
+}
+
+function showWobbleHint() {
+  if (wobbleHintShown) return;
+  wobbleHintShown = true;
+  hintEl.textContent = WOBBLE_HINT;
+  hintEl.classList.remove('hidden');
+}
 
 function render() {
   const dna = GENES[geneIndex].dna;
-  // DNA row: show template 5'->3' with codon grouping
-  let dnaHtml = "<span class='label'>5'</span>";
-  for (let i = 0; i < dna.length; i++) {
-    if (i > 0 && i % 3 === 0) dnaHtml += "<span class='codon-group'></span>";
-    dnaHtml += `<span class='base'>${dna[i]}</span>`;
-  }
-  dnaHtml += "<span class='label'>3'</span>";
-  dnaEl.innerHTML = dnaHtml;
+  const gapAt = i => (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
 
-  // mRNA row: correct bases shown, pending shown faintly
-  let rnaHtml = "<span class='label'>5'</span>";
-  for (let i = 0; i < dna.length; i++) {
-    if (i > 0 && i % 3 === 0) dnaHtml; // no-op keep structure
-    if (i > 0 && i % 3 === 0) {
-      // spacer between codon groups handled by margin on .codon-group in dna row only;
-      // for mRNA we just add a small gap via a zero-width spacer
-    }
-    if (i < typed.length) {
-      const ok = typed[i] === PAIR[dna[i]];
-      const cls = ok ? 'correct' : 'wrong';
-      // show what the player typed
-      const ch = typed[i] === ' ' ? '&nbsp;' : typed[i];
-      if (i > 0 && i % 3 === 0) {
-        // gap
-      }
-      let gap = '';
-      if (i > 0 && i % 3 === 0) gap = "<span style='display:inline-block;width:6px'></span>";
-      if (i === 3 || i === 6 || i === 9 || i === 12 || i === 15 || i === 18) {
-        // handled above
-      }
-      if (i > 0 && i % 3 === 0) gap = "<span style='display:inline-block;width:6px'></span>";
-      // simpler: just render with small gaps every 3
-      gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
-      // avoid double gaps: recompute cleanly below
-    }
-  }
-  // Cleaner mRNA render:
-  let m = "<span class='label'>5'</span>";
-  for (let i = 0; i < dna.length; i++) {
-    const gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
-    if (i < typed.length) {
-      const ok = typed[i] === PAIR[dna[i]];
-      m += gap + `<span class='base ${ok ? 'correct' : 'wrong'}'>${typed[i]}</span>`;
-    } else {
-      m += gap + `<span class='base pending'>${PAIR[dna[i]]}</span>`;
-    }
-  }
-  m += "<span class='label'>3'</span>";
-  // The above double-renders; rebuild properly:
-  m = "<span class='label'>5'</span>";
-  for (let i = 0; i < dna.length; i++) {
-    const gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
-    if (i < typed.length) {
-      const ok = typed[i] === PAIR[dna[i]];
-      m += gap + `<span class='base ${ok ? 'correct' : 'wrong'}'>${typed[i]}</span>`;
-    } else {
-      m += gap + `<span class='base pending'>·</span>`;
-    }
-  }
-  m += "<span class='label'>3'</span>";
-  // Actually simplest robust approach: rebuild from scratch without the messy first loop.
-  // (The first loop above is dead code that writes to dnaHtml; harmless but ugly.
-  // We'll just set m as computed.)
-  // Fix: the first loop also appended to dnaEl via dnaHtml variable but never used it after.
-  // Re-set dnaEl cleanly too:
+  // DNA row: the template, 5'->3', grouped by codon
   let d = "<span class='label'>5'</span>";
   for (let i = 0; i < dna.length; i++) {
-    const gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
-    d += gap + `<span class='base'>${dna[i]}</span>`;
+    d += gapAt(i) + `<span class='base'>${dna[i]}</span>`;
   }
   d += "<span class='label'>3'</span>";
+
+  // mRNA row: the bases the player typed (green correct, amber wobble, red wrong), pending faint
+  let m = "<span class='label'>5'</span>";
+  for (let i = 0; i < dna.length; i++) {
+    if (i < typed.length) {
+      m += gapAt(i) + `<span class='base ${baseStatus(i)}'>${typed[i]}</span>`;
+    } else {
+      m += gapAt(i) + `<span class='base pending'>·</span>`;
+    }
+  }
+  m += "<span class='label'>3'</span>";
+
   dnaEl.innerHTML = d;
   rnaEl.innerHTML = m;
 
-  typedEl.innerHTML = typed.split('').join('') + "<span class='cursor'>|</span>";
+  typedEl.innerHTML = typed + "<span class='cursor'>|</span>";
   proteinEl.innerHTML = protein.map(aa => {
     const bg = COLOR[aa] || '#8b949e';
     return `<span class='bead' style='background:${bg};color:#0d1117'>${aa}</span>`;
@@ -216,13 +217,30 @@ function render() {
   statsEl.textContent = `Gene ${geneIndex + 1} of ${GENES.length}  ·  ${mistakes} mistake${mistakes === 1 ? '' : 's'}  ·  ${bpm} bases/min`;
 }
 
+function finishGene(reason) {
+  finished = true;
+  const elapsed = (Date.now() - startTime) / 1000;
+  const bpm = Math.round(typed.length / elapsed * 60);
+  endMsg.textContent = `Protein complete: ${protein.join('-')}  ·  ${mistakes} mistakes  ·  ${bpm} bases/min. ${reason}`;
+  endScreen.classList.remove('hidden');
+  startScreen.classList.add('hidden');
+  feedbackEl.textContent = '';
+}
+
 function checkCodons() {
-  // Every 3 typed bases, evaluate the codon
+  // Every 3 typed mRNA bases, evaluate the codon
   while (typed.length >= 3 && protein.length * 3 < typed.length) {
     const start = protein.length * 3;
     const codon = typed.slice(start, start + 3);
     if (codon.length < 3) break;
-    const aa = CODONS[codon];
+    // A wobble-accepted 3rd base is read as the expected base, so it never changes the
+    // amino acid. Hard errors are translated exactly as typed (missense / nonsense).
+    let readCodon = '';
+    for (let k = 0; k < 3; k++) {
+      readCodon += baseStatus(start + k) === 'wobble' ? expectedBase(start + k) : codon[k];
+    }
+    const wobbled = readCodon !== codon;
+    const aa = CODONS[readCodon];
     if (aa === undefined) {
       // invalid codon — treat as mistake, don't advance protein
       mistakes++;
@@ -232,35 +250,50 @@ function checkCodons() {
     }
     if (aa === null) {
       // stop codon
-      finished = true;
-      const elapsed = (Date.now() - startTime) / 1000;
-      const bpm = Math.round(typed.length / elapsed * 60);
-      endMsg.textContent = `Protein complete: ${protein.join('-')}  ·  ${mistakes} mistakes  ·  ${bpm} bases/min. Stop codon hit.`;
-      endScreen.classList.remove('hidden);
-      startScreen.classList.add('hidden);
-      feedbackEl.textContent = '';
+      finishGene('Stop codon hit.');
       break;
     }
     protein.push(aa);
-    feedbackEl.textContent = `Codon ${codon} → ${aa}`;
-    feedbackEl.className = 'good';
+    if (wobbled) {
+      feedbackEl.textContent = `Codon ${codon} → ${aa} (wobble: read like ${readCodon}, same amino acid)`;
+      feedbackEl.className = 'wobble';
+    } else {
+      feedbackEl.textContent = `Codon ${codon} → ${aa}`;
+      feedbackEl.className = 'good';
+    }
+  }
+  // Whole template transcribed without a stop codon: the gene is done
+  if (!finished && typed.length >= GENES[geneIndex].dna.length) {
+    finishGene('End of template.');
   }
 }
 
 function onKey(e) {
-  if (finished || startScreen.classList.contains('') === false && !startTime) return;
-  if (!startTime) return; // not started
+  if (finished || !startTime) return; // not started, or gene already done
   if (e.key.length !== 1) return;
   const ch = e.key.toUpperCase();
-  if (!PAIR[ch] && ch !== 'A' && ch !== 'T' && ch !== 'G' && ch !== 'C') return;
-  // Only accept A, T, G, C (player types DNA letters; we map to RNA)
-  if (!['A','T','G','C'].includes(ch)) return;
-  typed += ch;
-  const expected = PAIR[GENES[geneIndex].dna[typed.length - 1]];
-  if (ch !== expected) {
-    mistakes++;
-    feedbackEl.textContent = `Wrong: you typed ${ch}, expected ${expected} (pairs with ${GENES[geneIndex].dna[typed.length-1]})`;
+  const dna = GENES[geneIndex].dna;
+  if (typed.length >= dna.length) return;
+  if (ch === 'T') {
+    // T is rejected: RNA uses U instead of T
+    feedbackEl.textContent = 'RNA has no T — type U instead (template A pairs with mRNA U).';
     feedbackEl.className = 'bad';
+    return;
+  }
+  // Only accept mRNA bases A, U, G, C
+  if (!RNA_KEYS.includes(ch)) return;
+  typed += ch;
+  const i = typed.length - 1;
+  const expected = expectedBase(i);
+  const status = baseStatus(i);
+  if (status === 'wrong') {
+    mistakes++;
+    feedbackEl.textContent = `Wrong mRNA base: you typed ${ch}, expected ${expected} (pairs with template ${dna[i]})`;
+    feedbackEl.className = 'bad';
+  } else if (status === 'wobble') {
+    feedbackEl.textContent = `Wobble: you typed ${ch}, expected ${expected} at codon position 3 — accepted`;
+    feedbackEl.className = 'wobble';
+    showWobbleHint();
   } else {
     feedbackEl.textContent = '';
   }
@@ -271,22 +304,23 @@ function onKey(e) {
 function startGame() {
   geneIndex = 0;
   pos = 0; typed = ''; protein = []; mistakes = 0; finished = false; startTime = Date.now();
-  startScreen.classList.add('hidden);
-  endScreen.classList.add('hidden);
-  stageLabel.textContent = 'Stage 1: Transcription — type the mRNA complement of the DNA template.';
+  startScreen.classList.add('hidden');
+  endScreen.classList.add('hidden');
+  stageLabel.textContent = `Stage 1: Transcription — type the mRNA bases for the DNA template. ${INSTRUCTIONS}`;
   render();
 }
 
 function nextGene() {
   geneIndex++;
   if (geneIndex >= GENES.length) {
-    endMsg.textContent = 'All genes done. You built real proteins by typing base pairs.';
-    endScreen.classList.remove('hidden);
+    endMsg.textContent = 'All genes done. You built real proteins by typing mRNA bases.';
+    endScreen.classList.remove('hidden');
     return;
   }
   typed = ''; protein = []; mistakes = 0; finished = false; startTime = Date.now();
-  endScreen.classList.add('hidden);
-  stageLabel.textContent = `Stage 1: Transcription — gene ${geneIndex + 1}.`;
+  endScreen.classList.add('hidden');
+  feedbackEl.textContent = '';
+  stageLabel.textContent = `Stage 1: Transcription — gene ${geneIndex + 1}: type the mRNA bases (A, U, G, C).`;
   render();
 }
 
