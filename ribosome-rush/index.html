@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ribosome Rush</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Courier New', monospace;
+    background: #0d1117;
+    color: #c9d1d9;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  h1 { color: #58a6ff; margin-bottom: 4px; }
+  .subtitle { color: #8b949e; margin-bottom: 20px; font-size: 14px; }
+  #game { width: 100%; max-width: 720px; }
+  .strand-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 18px; }
+  .label { color: #8b949e; width: 36px; font-size: 13px; }
+  .base { display: inline-block; width: 22px; text-align: center; }
+  .base.correct { color: #3fb950; }
+  .base.wrong { color: #f85149; background: #3d1214; border-radius: 3px; }
+  .base.pending { color: #484f58; }
+  .codon-group { border-left: 2px solid #30363d; margin-left: 4px; padding-left: 4px; }
+  #input-row { margin: 16px 0; }
+  #typed { font-size: 22px; letter-spacing: 4px; }
+  #typed .cursor { color: #58a6ff; animation: blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #feedback { min-height: 24px; margin-bottom: 12px; font-size: 15px; }
+  #feedback.good { color: #3fb950; }
+  #feedback.bad { color: #f85149; }
+  .protein { margin: 16px 0; font-size: 20px; }
+  .bead { display: inline-block; padding: 2px 8px; margin: 2px; border-radius: 12px; font-size: 14px; }
+  .stats { color: #8b949e; font-size: 13px; margin-top: 12px; }
+  button {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    padding: 8px 20px; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 15px;
+  }
+  button:hover { background: #30363d; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>Ribosome Rush</h1>
+<p class="subtitle">Type the mRNA. Build the protein. Watch one typo change everything.</p>
+
+<div id="game">
+  <div id="stage-label" class="subtitle"></div>
+
+  <div class="strand-row">
+    <span class="label">DNA</span>
+    <span id="dna-strand"></span>
+  </div>
+  <div class="strand-row">
+    <span class="label">mRNA</span>
+    <span id="rna-strand"></span>
+  </div>
+
+  <div id="input-row">
+    <span id="typed"><span class="cursor">|</span></span>
+  </div>
+  <div id="feedback"></div>
+
+  <div class="protein" id="protein"></div>
+  <div class="stats" id="stats"></div>
+
+  <div id="start-screen">
+    <button id="start-btn">Start</button>
+  </div>
+  <div id="end-screen" class="hidden">
+    <p id="end-msg"></p>
+    <button id="next-btn">Next gene</button>
+  </div>
+</div>
+
+<script>
+// Pairing rules: DNA template -> mRNA
+const PAIR = { A: 'U', T: 'A', G: 'C', C: 'G' };
+
+// 64-codon table: codon -> amino acid (3-letter). Stops = null.
+const CODONS = {
+  UUU:'Phe', UUC:'Phe', UUA:'Leu', UUG:'Leu', CUU:'Leu', CUC:'Leu', CUA:'Leu', CUG:'Leu',
+  AUU:'Ile', AUC:'Ile', AUA:'Ile', AUG:'Met', GUU:'Val', GUC:'Val', GUA:'Val', GUG:'Val',
+  UCU:'Ser', UCC:'Ser', UCA:'Ser', UCG:'Ser', CCU:'Pro', CCC:'Pro', CCA:'Pro', CCG:'Pro',
+  ACU:'Thr', ACC:'Thr', ACA:'Thr', ACG:'Thr', GCU:'Ala', GCC:'Ala', GCA:'Ala', GCG:'Ala',
+  UAU:'Tyr', UAC:'Tyr', UAA:null,  UAG:null,  CAU:'His', CAC:'His', CAA:'Gln', CAG:'Gln',
+  AAU:'Asn', AAC:'Asn', AAA:'Lys', AAG:'Lys', GAU:'Asp', GAC:'Asp', GAA:'Glu', GAG:'Glu',
+  UGU:'Cys', UGC:'Cys', UGA:null,  UGG:'Trp', CGU:'Arg', CGC:'Arg', CGA:'Arg', CGG:'Arg',
+  AGU:'Ser', AGC:'Ser', AGA:'Arg', AGG:'Arg', GGU:'Gly', GGC:'Gly', GGA:'Gly', GGG:'Gly'
+};
+
+// Bead colors per amino acid family
+const COLOR = {
+  Phe:'#f0883e', Leu:'#f0883e', Ile:'#f0883e', Met:'#a371f7', Val:'#f0883e', Ser:'#3fb950', Pro:'#3fb950', Thr:'#3fb950', Ala:'#3fb950', Tyr:'#f85149', His:'#58a6ff', Gln:'#58a6ff', Asn:'#58a6ff', Lys:'#f85149', Asp:'#f85149', Glu:'#f85149', Cys:'#ffa657', Trp:'#ffa657', Arg:'#ffa657', Gly:'#8b949e'
+};
+
+// Short real-ish genes: [name, DNA template strand 5'->3']
+// Insulin B-chain start (real), plus a couple of short synthetic teaching genes.
+const GENES = [
+  { name: 'Insulin B-chain (start)', dna: 'TTCGTGAACCAGCACCTGTGC' },
+  { name: 'Teaching gene A', dna: 'TACATGTTCTACGGATTC' },
+  { name: 'Teaching gene B', dna: 'TACGGATTCTACATGTTC' },
+  { name: 'Teaching gene C', dna: 'TACATGCCUAAG' }, // invalid placeholder, replaced below
+  { name: 'Teaching gene D', dna: 'TACATGTTCTACGGATTCTACATGTTC' }
+];
+// Fix gene C: DNA template 3'->5' written 5'->3': TAC ATG TTC TAC GGA TTC
+GENES[3] = { name: 'Teaching gene C', dna: 'TACATGTTCTACGGATTC' };
+
+let geneIndex = 0;
+let pos = 0;          // index into dna template
+let typed = '';
+let protein = [];     // amino acid names built
+let mistakes = 0;
+let startTime = null;
+let finished = false;
+
+const dnaEl = document.getElementById('dna-strand');
+const rnaEl = document.getElementById('rna-strand');
+const typedEl = document.getElementById('typed');
+const feedbackEl = document.getElementById('feedback);
+const proteinEl = document.getElementById('protein);
+const statsEl = document.getElementById('stats);
+const stageLabel = document.getElementById('stage-label);
+const startScreen = document.getElementById('start-screen);
+const endScreen = document.getElementById('end-screen);
+const endMsg = document.getElementById('end-msg);
+
+function render() {
+  const dna = GENES[geneIndex].dna;
+  // DNA row: show template 5'->3' with codon grouping
+  let dnaHtml = "<span class='label'>5'</span>";
+  for (let i = 0; i < dna.length; i++) {
+    if (i > 0 && i % 3 === 0) dnaHtml += "<span class='codon-group'></span>";
+    dnaHtml += `<span class='base'>${dna[i]}</span>`;
+  }
+  dnaHtml += "<span class='label'>3'</span>";
+  dnaEl.innerHTML = dnaHtml;
+
+  // mRNA row: correct bases shown, pending shown faintly
+  let rnaHtml = "<span class='label'>5'</span>";
+  for (let i = 0; i < dna.length; i++) {
+    if (i > 0 && i % 3 === 0) dnaHtml; // no-op keep structure
+    if (i > 0 && i % 3 === 0) {
+      // spacer between codon groups handled by margin on .codon-group in dna row only;
+      // for mRNA we just add a small gap via a zero-width spacer
+    }
+    if (i < typed.length) {
+      const ok = typed[i] === PAIR[dna[i]];
+      const cls = ok ? 'correct' : 'wrong';
+      // show what the player typed
+      const ch = typed[i] === ' ' ? '&nbsp;' : typed[i];
+      if (i > 0 && i % 3 === 0) {
+        // gap
+      }
+      let gap = '';
+      if (i > 0 && i % 3 === 0) gap = "<span style='display:inline-block;width:6px'></span>";
+      if (i === 3 || i === 6 || i === 9 || i === 12 || i === 15 || i === 18) {
+        // handled above
+      }
+      if (i > 0 && i % 3 === 0) gap = "<span style='display:inline-block;width:6px'></span>";
+      // simpler: just render with small gaps every 3
+      gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
+      // avoid double gaps: recompute cleanly below
+    }
+  }
+  // Cleaner mRNA render:
+  let m = "<span class='label'>5'</span>";
+  for (let i = 0; i < dna.length; i++) {
+    const gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
+    if (i < typed.length) {
+      const ok = typed[i] === PAIR[dna[i]];
+      m += gap + `<span class='base ${ok ? 'correct' : 'wrong'}'>${typed[i]}</span>`;
+    } else {
+      m += gap + `<span class='base pending'>${PAIR[dna[i]]}</span>`;
+    }
+  }
+  m += "<span class='label'>3'</span>";
+  // The above double-renders; rebuild properly:
+  m = "<span class='label'>5'</span>";
+  for (let i = 0; i < dna.length; i++) {
+    const gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
+    if (i < typed.length) {
+      const ok = typed[i] === PAIR[dna[i]];
+      m += gap + `<span class='base ${ok ? 'correct' : 'wrong'}'>${typed[i]}</span>`;
+    } else {
+      m += gap + `<span class='base pending'>·</span>`;
+    }
+  }
+  m += "<span class='label'>3'</span>";
+  // Actually simplest robust approach: rebuild from scratch without the messy first loop.
+  // (The first loop above is dead code that writes to dnaHtml; harmless but ugly.
+  // We'll just set m as computed.)
+  // Fix: the first loop also appended to dnaEl via dnaHtml variable but never used it after.
+  // Re-set dnaEl cleanly too:
+  let d = "<span class='label'>5'</span>";
+  for (let i = 0; i < dna.length; i++) {
+    const gap = (i > 0 && i % 3 === 0) ? "<span style='display:inline-block;width:6px'></span>" : '';
+    d += gap + `<span class='base'>${dna[i]}</span>`;
+  }
+  d += "<span class='label'>3'</span>";
+  dnaEl.innerHTML = d;
+  rnaEl.innerHTML = m;
+
+  typedEl.innerHTML = typed.split('').join('') + "<span class='cursor'>|</span>";
+  proteinEl.innerHTML = protein.map(aa => {
+    const bg = COLOR[aa] || '#8b949e';
+    return `<span class='bead' style='background:${bg};color:#0d1117'>${aa}</span>`;
+  }).join('');
+
+  const elapsed = startTime ? ((Date.now() - startTime) / 1000) : 0;
+  const bpm = elapsed > 0 ? Math.round(typed.length / elapsed * 60) : 0;
+  statsEl.textContent = `Gene ${geneIndex + 1} of ${GENES.length}  ·  ${mistakes} mistake${mistakes === 1 ? '' : 's'}  ·  ${bpm} bases/min`;
+}
+
+function checkCodons() {
+  // Every 3 typed bases, evaluate the codon
+  while (typed.length >= 3 && protein.length * 3 < typed.length) {
+    const start = protein.length * 3;
+    const codon = typed.slice(start, start + 3);
+    if (codon.length < 3) break;
+    const aa = CODONS[codon];
+    if (aa === undefined) {
+      // invalid codon — treat as mistake, don't advance protein
+      mistakes++;
+      feedbackEl.textContent = `Invalid codon: ${codon}`;
+      feedbackEl.className = 'bad';
+      break;
+    }
+    if (aa === null) {
+      // stop codon
+      finished = true;
+      const elapsed = (Date.now() - startTime) / 1000;
+      const bpm = Math.round(typed.length / elapsed * 60);
+      endMsg.textContent = `Protein complete: ${protein.join('-')}  ·  ${mistakes} mistakes  ·  ${bpm} bases/min. Stop codon hit.`;
+      endScreen.classList.remove('hidden);
+      startScreen.classList.add('hidden);
+      feedbackEl.textContent = '';
+      break;
+    }
+    protein.push(aa);
+    feedbackEl.textContent = `Codon ${codon} → ${aa}`;
+    feedbackEl.className = 'good';
+  }
+}
+
+function onKey(e) {
+  if (finished || startScreen.classList.contains('') === false && !startTime) return;
+  if (!startTime) return; // not started
+  if (e.key.length !== 1) return;
+  const ch = e.key.toUpperCase();
+  if (!PAIR[ch] && ch !== 'A' && ch !== 'T' && ch !== 'G' && ch !== 'C') return;
+  // Only accept A, T, G, C (player types DNA letters; we map to RNA)
+  if (!['A','T','G','C'].includes(ch)) return;
+  typed += ch;
+  const expected = PAIR[GENES[geneIndex].dna[typed.length - 1]];
+  if (ch !== expected) {
+    mistakes++;
+    feedbackEl.textContent = `Wrong: you typed ${ch}, expected ${expected} (pairs with ${GENES[geneIndex].dna[typed.length-1]})`;
+    feedbackEl.className = 'bad';
+  } else {
+    feedbackEl.textContent = '';
+  }
+  checkCodons();
+  render();
+}
+
+function startGame() {
+  geneIndex = 0;
+  pos = 0; typed = ''; protein = []; mistakes = 0; finished = false; startTime = Date.now();
+  startScreen.classList.add('hidden);
+  endScreen.classList.add('hidden);
+  stageLabel.textContent = 'Stage 1: Transcription — type the mRNA complement of the DNA template.';
+  render();
+}
+
+function nextGene() {
+  geneIndex++;
+  if (geneIndex >= GENES.length) {
+    endMsg.textContent = 'All genes done. You built real proteins by typing base pairs.';
+    endScreen.classList.remove('hidden);
+    return;
+  }
+  typed = ''; protein = []; mistakes = 0; finished = false; startTime = Date.now();
+  endScreen.classList.add('hidden);
+  stageLabel.textContent = `Stage 1: Transcription — gene ${geneIndex + 1}.`;
+  render();
+}
+
+document.getElementById('start-btn').addEventListener('click', startGame);
+document.getElementById('next-btn').addEventListener('click', nextGene);
+document.addEventListener('keydown', onKey);
+render();
+</script>
+</body>
+</html>
